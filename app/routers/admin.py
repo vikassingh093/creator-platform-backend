@@ -3,6 +3,7 @@ from pydantic import BaseModel
 from app.middleware.auth_middleware import require_admin
 from app.database import execute_query
 import logging
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["Admin"])
@@ -14,9 +15,16 @@ class ApproveCreatorRequest(BaseModel):
 class BlockUserRequest(BaseModel):
     is_blocked: bool
 
-class PayoutActionRequest(BaseModel):
-    action: str  # paid | rejected
-    note: str = None
+class WithdrawalActionRequest(BaseModel):
+    action: str  # approved | rejected
+    note: Optional[str] = None
+
+class ContentActionRequest(BaseModel):
+    action: str  # approved | rejected
+    note: Optional[str] = None
+
+class CommissionUpdateRequest(BaseModel):
+    commission_percent: float
 
 @router.get("/stats")
 def get_stats(current_user: dict = Depends(require_admin)):
@@ -37,8 +45,12 @@ def get_stats(current_user: dict = Depends(require_admin)):
         "SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE type = 'add_money' AND status = 'success'",
         fetch_one=True
     )
-    pending_payouts = execute_query(
-        "SELECT COUNT(*) as count, COALESCE(SUM(amount), 0) as total FROM payout_requests WHERE status = 'pending'",
+    pending_withdrawals = execute_query(
+        "SELECT COUNT(*) as count, COALESCE(SUM(amount), 0) as total FROM withdrawal_requests WHERE status = 'pending'",
+        fetch_one=True
+    )
+    pending_content = execute_query(
+        "SELECT COUNT(*) as count FROM content WHERE status = 'pending'",
         fetch_one=True
     )
 
@@ -49,8 +61,9 @@ def get_stats(current_user: dict = Depends(require_admin)):
             "total_creators": total_creators["count"],
             "pending_approvals": pending_creators["count"],
             "total_revenue": float(total_revenue["total"]),
-            "pending_payouts_count": pending_payouts["count"],
-            "pending_payouts_amount": float(pending_payouts["total"])
+            "pending_withdrawals_count": pending_withdrawals["count"],
+            "pending_withdrawals_amount": float(pending_withdrawals["total"]),
+            "pending_content": pending_content["count"],
         }
     }
 
@@ -97,30 +110,20 @@ def approve_reject_creator(
     """Approve or reject creator"""
     if body.action == "approve":
         execute_query(
-            """
-            UPDATE creator_profiles SET is_approved = TRUE, is_rejected = FALSE
-            WHERE id = %s
-            """,
+            "UPDATE creator_profiles SET is_approved = TRUE, is_rejected = FALSE WHERE id = %s",
             (creator_id,)
         )
-        # Update user type to creator
         execute_query(
             """
-            UPDATE users u
-            JOIN creator_profiles cp ON cp.user_id = u.id
-            SET u.user_type = 'creator'
-            WHERE cp.id = %s
+            UPDATE users u JOIN creator_profiles cp ON cp.user_id = u.id
+            SET u.user_type = 'creator' WHERE cp.id = %s
             """,
             (creator_id,)
         )
         return {"success": True, "message": "Creator approved!"}
-
     elif body.action == "reject":
         execute_query(
-            """
-            UPDATE creator_profiles SET is_approved = FALSE, is_rejected = TRUE
-            WHERE id = %s
-            """,
+            "UPDATE creator_profiles SET is_approved = FALSE, is_rejected = TRUE WHERE id = %s",
             (creator_id,)
         )
         return {"success": True, "message": "Creator rejected!"}
@@ -132,7 +135,7 @@ def get_all_users(current_user: dict = Depends(require_admin)):
     """Get all users"""
     users = execute_query(
         """
-        SELECT u.id, u.name, u.phone, u.email, u.user_type,
+        SELECT u.id, u.name, u.phone, u.user_type,
                u.is_blocked, u.created_at,
                w.balance as wallet_balance
         FROM users u
@@ -157,46 +160,117 @@ def block_unblock_user(
     action = "blocked" if body.is_blocked else "unblocked"
     return {"success": True, "message": f"User {action} successfully"}
 
-@router.get("/payouts")
-def get_payout_requests(current_user: dict = Depends(require_admin)):
-    """Get all payout requests"""
-    payouts = execute_query(
-        """
-        SELECT pr.id, pr.amount, pr.upi_id, pr.status,
-               pr.requested_at, pr.processed_at, pr.admin_note,
-               u.name as creator_name, u.phone as creator_phone
-        FROM payout_requests pr
-        JOIN creator_profiles cp ON cp.id = pr.creator_id
-        JOIN users u ON u.id = cp.user_id
-        ORDER BY pr.requested_at DESC
-        """,
-        fetch_all=True
-    )
-    return {"success": True, "data": payouts}
+# ── Withdrawal Management ─────────────────────────────────
 
-@router.put("/payouts/{payout_id}")
-def process_payout(
-    payout_id: int,
-    body: PayoutActionRequest,
+@router.get("/withdrawals")
+def get_withdrawals(
+    status: str = "all",
     current_user: dict = Depends(require_admin)
 ):
-    """Process payout request"""
-    payout = execute_query(
-        "SELECT * FROM payout_requests WHERE id = %s",
-        (payout_id,),
+    condition = ""
+    params = []
+    if status != "all":
+        condition = "WHERE wr.status = %s"
+        params.append(status)
+
+    withdrawals = execute_query(
+        f"""
+        SELECT wr.id, wr.amount, wr.method, wr.upi_id, wr.bank_name,
+               wr.account_number, wr.ifsc_code, wr.account_holder,
+               wr.status, wr.admin_note, wr.created_at, wr.updated_at,
+               u.name AS creator_name, u.phone AS creator_phone, u.id AS creator_user_id
+        FROM withdrawal_requests wr
+        JOIN users u ON u.id = wr.creator_id
+        {condition}
+        ORDER BY wr.created_at DESC
+        """,
+        tuple(params) if params else None,
+        fetch_all=True
+    )
+    return {"success": True, "data": withdrawals or []}
+
+@router.put("/withdrawals/{withdrawal_id}")
+def process_withdrawal(
+    withdrawal_id: int,
+    body: WithdrawalActionRequest,
+    current_user: dict = Depends(require_admin)
+):
+    withdrawal = execute_query(
+        "SELECT * FROM withdrawal_requests WHERE id = %s",
+        (withdrawal_id,),
         fetch_one=True
     )
-    if not payout:
-        raise HTTPException(status_code=404, detail="Payout not found")
-    if payout["status"] != "pending":
-        raise HTTPException(status_code=400, detail="Payout already processed")
+    if not withdrawal:
+        raise HTTPException(status_code=404, detail="Withdrawal not found")
+    if withdrawal["status"] != "pending":
+        raise HTTPException(status_code=400, detail="Already processed")
 
     execute_query(
-        """
-        UPDATE payout_requests
-        SET status = %s, admin_note = %s, processed_at = NOW()
-        WHERE id = %s
-        """,
-        (body.action, body.note, payout_id)
+        "UPDATE withdrawal_requests SET status = %s, admin_note = %s, updated_at = NOW() WHERE id = %s",
+        (body.action, body.note, withdrawal_id)
     )
-    return {"success": True, "message": f"Payout marked as {body.action}"}
+
+    if body.action == "approved":
+        # Update total_withdrawn in creator wallet
+        execute_query(
+            "UPDATE creator_wallet SET total_withdrawn = total_withdrawn + %s WHERE creator_id = %s",
+            (withdrawal["amount"], withdrawal["creator_id"])
+        )
+    elif body.action == "rejected":
+        # Refund balance back
+        execute_query(
+            "UPDATE creator_wallet SET balance = balance + %s WHERE creator_id = %s",
+            (withdrawal["amount"], withdrawal["creator_id"])
+        )
+
+    return {"success": True, "message": f"Withdrawal {body.action}"}
+
+# ── Content Moderation ────────────────────────────────────
+
+@router.get("/content")
+def get_all_content(
+    status: str = "all",
+    current_user: dict = Depends(require_admin)
+):
+    condition = ""
+    params = []
+    if status != "all":
+        condition = "WHERE c.status = %s"
+        params.append(status)
+
+    content = execute_query(
+        f"""
+        SELECT c.id, c.title, c.description, c.type AS content_type,
+               c.price, c.is_free, c.thumbnail, c.status, c.created_at,
+               cf.file_url,
+               u.name AS creator_name, u.id AS creator_id
+        FROM content c
+        LEFT JOIN content_files cf ON c.id = cf.content_id AND cf.file_order = 0
+        JOIN users u ON u.id = c.creator_id
+        {condition}
+        ORDER BY c.created_at DESC
+        """,
+        tuple(params) if params else None,
+        fetch_all=True
+    )
+    return {"success": True, "data": content or []}
+
+@router.put("/content/{content_id}")
+def moderate_content(
+    content_id: int,
+    body: ContentActionRequest,
+    current_user: dict = Depends(require_admin)
+):
+    content = execute_query(
+        "SELECT * FROM content WHERE id = %s",
+        (content_id,),
+        fetch_one=True
+    )
+    if not content:
+        raise HTTPException(status_code=404, detail="Content not found")
+
+    execute_query(
+        "UPDATE content SET status = %s WHERE id = %s",
+        (body.action, content_id)
+    )
+    return {"success": True, "message": f"Content {body.action}"}

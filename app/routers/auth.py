@@ -94,3 +94,25 @@ def logout(body: dict):
         revoke_token(user_id)
         logger.info(f"✅ User logged out: ID {user_id}")
     return {"success": True, "message": "Logged out successfully"}
+
+@router.post("/refresh")
+def refresh_token(data: dict):
+    refresh_token = data.get("refresh_token")
+    if not refresh_token:
+        raise HTTPException(status_code=401, detail="Refresh token required")
+
+    payload = verify_token(refresh_token)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
+
+    user_id = payload.get("sub") or payload.get("user_id") or payload.get("id")
+    user = execute_query(
+        "SELECT * FROM users WHERE id = %s",
+        (int(user_id),),
+        fetch_one=True
+    )
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+
+    new_token = create_access_token({"sub": str(user["id"]), "user_type": user["user_type"]})
+    return {"access_token": new_token, "token_type": "bearer"}

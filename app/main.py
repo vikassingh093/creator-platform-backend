@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from app.config import settings
 from app.database_setup import create_tables, create_admin
-from app.routers import auth, users, creators, wallet, chat
+from app.routers import auth, users, creators, chat, wallet, content, admin, notifications, calls
 from app.websocket.chat_manager import router as ws_router
 import os
 import logging
@@ -38,8 +38,12 @@ app.mount("/uploads", StaticFiles(directory=settings.UPLOAD_DIR), name="uploads"
 app.include_router(auth.router, prefix="/api/v1")
 app.include_router(users.router, prefix="/api/v1")
 app.include_router(creators.router, prefix="/api/v1")
-app.include_router(wallet.router, prefix="/api/v1")
 app.include_router(chat.router, prefix="/api/v1")
+app.include_router(wallet.router, prefix="/api/v1")
+app.include_router(content.router, prefix="/api/v1")
+app.include_router(admin.router, prefix="/api/v1")
+app.include_router(notifications.router, prefix="/api/v1")
+app.include_router(calls.router, prefix="/api/v1")
 app.include_router(ws_router)
 
 @app.on_event("startup")
