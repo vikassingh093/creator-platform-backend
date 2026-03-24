@@ -7,3 +7,20 @@ __pycache__/
 *.log
 .DS_Store
 database/full_backup.sql
+
+# Media uploads
+uploads/
+media/
+static/uploads/
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.webp
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.mp3
+*.wav
