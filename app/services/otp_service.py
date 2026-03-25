@@ -1,6 +1,6 @@
 import random
 import string
-from app.config import settings
+from app.config import OTP_EXPIRE_MINUTES, OTP_LENGTH
 from app.redis_client import redis_set, redis_get, redis_delete, redis_increment
 import logging
 
@@ -19,7 +19,7 @@ TEST_PHONES = [
 TEST_OTP = "123456"
 
 def generate_otp() -> str:
-    return ''.join(random.choices(string.digits, k=settings.OTP_LENGTH))
+    return ''.join(random.choices(string.digits, k=OTP_LENGTH))
 
 def send_otp(phone: str) -> dict:
     logger.info(f"send_otp called with phone: '{phone}'")
@@ -44,7 +44,7 @@ def send_otp(phone: str) -> dict:
         }
 
     otp = generate_otp()
-    expire_seconds = settings.OTP_EXPIRE_MINUTES * 60
+    expire_seconds = OTP_EXPIRE_MINUTES * 60
 
     redis_set(
         f"{OTP_PREFIX}{phone}",

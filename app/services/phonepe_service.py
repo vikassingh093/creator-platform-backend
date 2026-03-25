@@ -31,7 +31,7 @@ def initiate_payment(user_id: int, amount: float, phone: str) -> dict:
     )
 
     # MOCK response for sandbox/testing
-    if settings.APP_ENV == "local":
+    if APP_ENV == "local":
         return {
             "merchant_transaction_id": merchant_transaction_id,
             "amount": amount,
@@ -41,7 +41,7 @@ def initiate_payment(user_id: int, amount: float, phone: str) -> dict:
 
     # Real PhonePe API
     payload = {
-        "merchantId": settings.PHONEPE_MERCHANT_ID,
+        "merchantId": PHONEPE_MERCHANT_ID,
         "merchantTransactionId": merchant_transaction_id,
         "merchantUserId": f"USER_{user_id}",
         "amount": amount_paise,
@@ -53,7 +53,7 @@ def initiate_payment(user_id: int, amount: float, phone: str) -> dict:
     }
 
     encoded = base64.b64encode(json.dumps(payload).encode()).decode()
-    checksum_str = encoded + "/pg/v1/pay" + settings.PHONEPE_SALT_KEY
+    checksum_str = encoded + "/pg/v1/pay" + PHONEPE_SALT_KEY
     checksum = hashlib.sha256(checksum_str.encode()).hexdigest() + f"###{settings.PHONEPE_SALT_INDEX}"
 
     headers = {
@@ -63,7 +63,7 @@ def initiate_payment(user_id: int, amount: float, phone: str) -> dict:
 
     try:
         response = httpx.post(
-            f"{settings.PHONEPE_BASE_URL}/pg/v1/pay",
+            f"{PHONEPE_BASE_URL}/pg/v1/pay",
             json={"request": encoded},
             headers=headers,
             timeout=30
@@ -97,7 +97,7 @@ def verify_payment(merchant_transaction_id: str) -> dict:
         return {"success": True, "amount": float(payment["amount"]), "message": "Already verified"}
 
     # MOCK: auto verify in local
-    if settings.APP_ENV == "local":
+    if APP_ENV == "local":
         execute_query(
             "UPDATE payments SET status = 'success' WHERE merchant_transaction_id = %s",
             (merchant_transaction_id,)
@@ -109,7 +109,7 @@ def verify_payment(merchant_transaction_id: str) -> dict:
         }
 
     # Real verification via PhonePe API
-    checksum_str = f"/pg/v1/status/{settings.PHONEPE_MERCHANT_ID}/{merchant_transaction_id}{settings.PHONEPE_SALT_KEY}"
+    checksum_str = f"/pg/v1/status/{PHONEPE_MERCHANT_ID}/{merchant_transaction_id}{settings.PHONEPE_SALT_KEY}"
     checksum = hashlib.sha256(checksum_str.encode()).hexdigest() + f"###{settings.PHONEPE_SALT_INDEX}"
 
     try:

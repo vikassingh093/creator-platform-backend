@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException, Depends, Query, UploadFile, File, Form
 from app.database import execute_query
 from app.middleware.auth_middleware import get_current_user
+from app.config import CHAT_PLATFORM_COMMISSION  # ✅ ADD THIS
 import logging
 from pydantic import BaseModel
 from typing import Optional
@@ -26,11 +27,17 @@ class WithdrawalRequest(BaseModel):
 
 # ── Helper: get commission setting ──────────────────────────
 def get_commission_percent() -> float:
+    """
+    Reads platform commission % from DB.
+    Falls back to CHAT_PLATFORM_COMMISSION from config if not set.
+    To change: UPDATE platform_settings SET setting_value='50' 
+               WHERE setting_key='platform_commission_percent'
+    """
     row = execute_query(
         "SELECT setting_value FROM platform_settings WHERE setting_key = 'platform_commission_percent'",
         fetch_one=True
     )
-    return float(row["setting_value"]) if row else 30.0
+    return float(row["setting_value"]) if row else CHAT_PLATFORM_COMMISSION  # ✅ was 30.0
 
 def get_creator_share(total_amount: float) -> tuple[float, float]:
     """Returns (creator_amount, platform_commission)"""

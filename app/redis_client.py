@@ -1,15 +1,15 @@
 import redis
 import json
-from app.config import settings
+from app.config import REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_PASSWORD
 import logging
 
 logger = logging.getLogger(__name__)
 
 redis_client = redis.Redis(
-    host=settings.REDIS_HOST,
-    port=settings.REDIS_PORT,
-    db=settings.REDIS_DB,
-    password=settings.REDIS_PASSWORD if settings.REDIS_PASSWORD else None,
+    host=REDIS_HOST,
+    port=REDIS_PORT,
+    db=REDIS_DB,
+    password=REDIS_PASSWORD if REDIS_PASSWORD else None,
     decode_responses=True,
     socket_connect_timeout=5,
     socket_timeout=5,

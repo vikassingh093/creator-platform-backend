@@ -1,17 +1,17 @@
 import pymysql
 import pymysql.cursors
-from app.config import settings
+from app.config import DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME
 from contextlib import contextmanager
 import logging
 
 logger = logging.getLogger(__name__)
 
 DB_CONFIG = {
-    "host": settings.DB_HOST,
-    "port": settings.DB_PORT,
-    "user": settings.DB_USER,
-    "password": settings.DB_PASSWORD,
-    "database": settings.DB_NAME,
+    "host": DB_HOST,
+    "port": DB_PORT,
+    "user": DB_USER,
+    "password": DB_PASSWORD,
+    "database": DB_NAME,
     "charset": "utf8mb4",
     "cursorclass": pymysql.cursors.DictCursor,
     "autocommit": False,
