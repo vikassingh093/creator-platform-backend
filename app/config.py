@@ -1,7 +1,19 @@
 import os
-from dotenv import load_dotenv
+from pathlib import Path
 
-load_dotenv()
+# ✅ Load .env manually — no dotenv library needed
+# Reads .env once at server start, loads all values into os.environ
+env_file = Path(__file__).resolve().parent.parent / ".env"
+if env_file.exists():
+    with open(env_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            os.environ.setdefault(key, value)
 
 # ─── APP ──────────────────────────────────────────────────
 APP_NAME    = os.getenv("APP_NAME", "CreatorHub")
@@ -56,3 +68,9 @@ CHAT_PLATFORM_COMMISSION = 50.0   # platform takes 50% of chat cost
 # ─── CALL SETTINGS ────────────────────────────────────────
 CALL_RING_TIMEOUT_SECONDS  = 30   # auto-expire ringing calls after 30s
 CALL_STUCK_TIMEOUT_MINUTES = 5    # auto-expire stuck active calls after 5min
+
+# ─── MTALKZ ───────────────────────────────────────────────
+MTALKZ_API_KEY      = os.getenv("MTALKZ_API_KEY", "")
+MTALKZ_SENDER_ID    = os.getenv("MTALKZ_SENDER_ID", "")
+MTALKZ_FORMAT       = os.getenv("MTALKZ_FORMAT", "json")
+MTALKZ_SEND_SMS_URL = os.getenv("MTALKZ_SEND_SMS_BASE_URL", "https://msgn.mtalkz.com/api")

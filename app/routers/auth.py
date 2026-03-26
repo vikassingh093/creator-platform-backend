@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from app.services.otp_service import send_otp, verify_otp
-from app.services.jwt_service import create_access_token, create_refresh_token, revoke_token
+from app.services.jwt_service import create_access_token, create_refresh_token, revoke_token, verify_token
 from app.database import execute_query
 from app.redis_client import redis_set, redis_delete
 import logging
@@ -28,7 +28,9 @@ def send_otp_route(body: SendOTPRequest):
     if phone.startswith("91") and len(phone) == 12:
         phone = phone[2:]
 
+    logger.info(f"📲 /send-otp endpoint hit — normalized phone: {phone}")
     result = send_otp(phone)
+    logger.info(f"📲 /send-otp result: {result}")
     return result
 
 @router.post("/verify-otp")

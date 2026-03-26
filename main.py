@@ -1,9 +1,11 @@
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
+from app.config import APP_NAME
+from app.routers import auth, users, creators, chat, wallet, content, admin, notifications, calls
 import os
 
-app = FastAPI()
+app = FastAPI(title=APP_NAME)
 
 # ✅ Serve uploaded files as static
 os.makedirs("uploads/images", exist_ok=True)
