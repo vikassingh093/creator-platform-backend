@@ -3,8 +3,17 @@ from app.database import execute_query
 from app.middleware.auth_middleware import get_current_user
 from app.services.jwt_service import verify_token
 from app.services.notification_service import create_notification
-from app.routers.creators import get_creator_share
-from app.utils.helpers import fix_photos, full_image_url  # ✅ ADD THIS
+from app.utils.helpers import fix_photos, full_image_url
+
+# ✅ Import helpers — all money logic lives there
+from app.helpers.wallet_helper import (
+    debit_wallet, credit_creator_wallet, get_balance,
+    has_sufficient_balance
+)
+from app.helpers.transaction_helper import (
+    record_chat_transaction, calculate_split
+)
+
 import logging
 import json
 import asyncio
@@ -38,15 +47,13 @@ def start_chat(creator_id: int, current_user: dict = Depends(get_current_user)):
     if not creator["is_online"]:
         raise HTTPException(status_code=400, detail="Creator is offline")
 
-    wallet = execute_query(
-        "SELECT balance FROM wallets WHERE user_id = %s",
-        (current_user["id"],),
-        fetch_one=True
-    )
-    if not wallet or float(wallet["balance"]) < float(creator["chat_rate"]):
+    # ✅ Use helper to check balance
+    balance = get_balance(current_user["id"])
+    chat_rate = float(creator["chat_rate"])
+    if balance < chat_rate:
         raise HTTPException(
             status_code=400,
-            detail=f"Insufficient balance. Minimum ₹{creator['chat_rate']} required"
+            detail=f"Insufficient balance. Minimum ₹{chat_rate} required"
         )
 
     existing_room = execute_query(
@@ -56,18 +63,23 @@ def start_chat(creator_id: int, current_user: dict = Depends(get_current_user)):
     )
 
     if existing_room:
+        # ✅ Reactivate with billing fields
         execute_query(
-            "UPDATE chat_rooms SET status = 'active', created_at = CURRENT_TIMESTAMP WHERE id = %s",
-            (existing_room["id"],)
+            """
+            UPDATE chat_rooms 
+            SET status = 'active', created_at = CURRENT_TIMESTAMP,
+                rate_per_minute = %s, duration = 0, total_cost = 0.00, started_at = NULL
+            WHERE id = %s
+            """,
+            (chat_rate, existing_room["id"])
         )
         logger.info(f"Reactivated room: {existing_room['id']}")
-        
-        # ✅ Delete old notifications for this room first to prevent duplicates
+
         execute_query(
             "DELETE FROM notifications WHERE reference_id = %s AND type = 'chat'",
             (f"room_{existing_room['id']}",)
         )
-        
+
         create_notification(
             user_id=creator_id,
             title="New Chat Request 💬",
@@ -84,9 +96,13 @@ def start_chat(creator_id: int, current_user: dict = Depends(get_current_user)):
         )
         return {"success": True, "room_id": existing_room["id"], "creator": creator}
 
+    # ✅ Create new room with rate_per_minute
     execute_query(
-        "INSERT INTO chat_rooms (user_id, creator_id, status) VALUES (%s, %s, 'active')",
-        (current_user["id"], creator_id)
+        """
+        INSERT INTO chat_rooms (user_id, creator_id, status, rate_per_minute)
+        VALUES (%s, %s, 'active', %s)
+        """,
+        (current_user["id"], creator_id, chat_rate)
     )
     room = execute_query(
         "SELECT id FROM chat_rooms WHERE user_id = %s AND creator_id = %s ORDER BY id DESC LIMIT 1",
@@ -94,7 +110,7 @@ def start_chat(creator_id: int, current_user: dict = Depends(get_current_user)):
         fetch_one=True
     )
     logger.info(f"New room created: {room['id']}")
-    # After room created/reactivated - notify creator
+
     create_notification(
         user_id=creator_id,
         title="New Chat Request 💬",
@@ -102,8 +118,6 @@ def start_chat(creator_id: int, current_user: dict = Depends(get_current_user)):
         type="chat",
         reference_id=f"room_{room['id']}"
     )
-
-    # Notify user - chat started
     create_notification(
         user_id=current_user["id"],
         title="Chat Started 💬",
@@ -113,6 +127,89 @@ def start_chat(creator_id: int, current_user: dict = Depends(get_current_user)):
     )
 
     return {"success": True, "room_id": room["id"], "creator": creator}
+
+
+@router.post("/creator/start-with-customer/{customer_id}")
+def creator_start_chat(customer_id: int, current_user: dict = Depends(get_current_user)):
+    """Creator initiates a chat with an online customer — FREE for creator to start"""
+    logger.info(f"creator_start_chat: creator={current_user['id']} customer_id={customer_id}")
+
+    if current_user["user_type"] != "creator":
+        raise HTTPException(status_code=403, detail="Only creators can use this endpoint")
+
+    customer = execute_query(
+        "SELECT id, name, profile_photo FROM users WHERE id = %s AND user_type IN ('customer', 'user') AND is_active = 1",
+        (customer_id,),
+        fetch_one=True
+    )
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+
+    # ✅ Get creator's chat rate
+    creator_profile = execute_query(
+        "SELECT chat_rate FROM creator_profiles WHERE user_id = %s",
+        (current_user["id"],),
+        fetch_one=True
+    )
+    chat_rate = float(creator_profile["chat_rate"]) if creator_profile else 0
+
+    existing_room = execute_query(
+        "SELECT id, status FROM chat_rooms WHERE user_id = %s AND creator_id = %s ORDER BY id DESC LIMIT 1",
+        (customer_id, current_user["id"]),
+        fetch_one=True
+    )
+
+    if existing_room:
+        execute_query(
+            """
+            UPDATE chat_rooms 
+            SET status = 'active', created_at = CURRENT_TIMESTAMP,
+                rate_per_minute = %s, duration = 0, total_cost = 0.00, started_at = NULL
+            WHERE id = %s
+            """,
+            (chat_rate, existing_room["id"])
+        )
+        logger.info(f"Reactivated room: {existing_room['id']}")
+
+        execute_query(
+            "DELETE FROM notifications WHERE reference_id = %s AND type = 'chat'",
+            (f"room_{existing_room['id']}",)
+        )
+
+        create_notification(
+            user_id=customer_id,
+            title="Creator wants to chat! 💬",
+            message=f"{current_user['name']} started a chat with you",
+            type="chat",
+            reference_id=f"room_{existing_room['id']}"
+        )
+
+        return {"success": True, "room_id": existing_room["id"], "customer": customer}
+
+    # ✅ Create new room with rate
+    execute_query(
+        """
+        INSERT INTO chat_rooms (user_id, creator_id, status, rate_per_minute)
+        VALUES (%s, %s, 'active', %s)
+        """,
+        (customer_id, current_user["id"], chat_rate)
+    )
+    room = execute_query(
+        "SELECT id FROM chat_rooms WHERE user_id = %s AND creator_id = %s ORDER BY id DESC LIMIT 1",
+        (customer_id, current_user["id"]),
+        fetch_one=True
+    )
+    logger.info(f"New room created by creator: {room['id']}")
+
+    create_notification(
+        user_id=customer_id,
+        title="Creator wants to chat! 💬",
+        message=f"{current_user['name']} started a chat with you",
+        type="chat",
+        reference_id=f"room_{room['id']}"
+    )
+
+    return {"success": True, "room_id": room["id"], "customer": customer}
 
 
 @router.get("/creator/active-rooms")
@@ -130,7 +227,6 @@ def get_creator_active_rooms(current_user: dict = Depends(get_current_user)):
         (current_user["id"],),
         fetch_all=True
     )
-    # ✅ Fix image URLs
     rooms = [fix_photos(r) for r in rooms] if rooms else []
     return {"success": True, "rooms": rooms}
 
@@ -162,7 +258,6 @@ def get_messages(room_id: int, current_user: dict = Depends(get_current_user)):
         (room_id,),
         fetch_all=True
     )
-    # ✅ Fix image URLs
     messages = [fix_photos(m) for m in messages] if messages else []
     return {"success": True, "messages": messages, "room": room}
 
@@ -179,7 +274,6 @@ def end_chat(room_id: int, current_user: dict = Depends(get_current_user)):
 
     execute_query("UPDATE chat_rooms SET status = 'ended' WHERE id = %s", (room_id,))
 
-    # Notify both parties - chat ended
     other_user_id = room["creator_id"] if current_user["id"] == room["user_id"] else room["user_id"]
     create_notification(
         user_id=other_user_id,
@@ -277,7 +371,12 @@ async def websocket_chat(websocket: WebSocket, room_id: int):
         if both_connected:
             rate = float(creator["chat_rate"]) if creator else 0
 
-            # Notify both chat started
+            # ✅ Mark billing start time on chat_rooms
+            execute_query(
+                "UPDATE chat_rooms SET started_at = NOW(), rate_per_minute = %s WHERE id = %s AND started_at IS NULL",
+                (rate, room_id)
+            )
+
             await broadcast_to_room(room_id, None, {
                 "type": "chat_started",
                 "message": "Chat started! Billing begins now."
@@ -334,15 +433,12 @@ async def websocket_chat(websocket: WebSocket, room_id: int):
                     "room_id": room_id,
                     "sender_id": user["id"],
                     "sender_name": user["name"],
-                    "sender_photo": full_image_url(user.get("profile_photo")),  # ✅ FIX
+                    "sender_photo": full_image_url(user.get("profile_photo")),
                     "message": msg_text,
                     "created_at": str(saved_msg["created_at"]) if saved_msg else None
                 })
 
-                # ✅ Notify the OTHER person
                 other_user_id = room["user_id"] if user["id"] == room["creator_id"] else room["creator_id"]
-
-                # Only notify if other person is NOT connected to websocket
                 other_connected = other_user_id in active_connections.get(room_id, {})
 
                 if not other_connected:
@@ -368,6 +464,36 @@ async def websocket_chat(websocket: WebSocket, room_id: int):
             active_billing[room_id].cancel()
             active_billing.pop(room_id, None)
             logger.info(f"⛔ Billing stopped - room {room_id}")
+
+        # ✅ Record summary transaction when chat ends
+        if room:
+            try:
+                final_room = execute_query(
+                    "SELECT * FROM chat_rooms WHERE id = %s",
+                    (room_id,),
+                    fetch_one=True
+                )
+                total_cost = float(final_room.get("total_cost") or 0) if final_room else 0
+                duration = int(final_room.get("duration") or 0) if final_room else 0
+
+                if total_cost > 0 and duration > 0:
+                    # Check if summary transaction already exists
+                    existing_tx = execute_query(
+                        "SELECT id FROM transactions WHERE reference_id = %s AND type = 'chat' LIMIT 1",
+                        (f"chat_{room_id}",),
+                        fetch_one=True
+                    )
+                    if not existing_tx:
+                        record_chat_transaction(
+                            user_id=final_room["user_id"],
+                            creator_id=final_room["creator_id"],
+                            duration_seconds=duration,
+                            total_cost=total_cost,
+                            room_id=room_id
+                        )
+                        logger.info(f"✅ Chat summary transaction: Room {room_id} | ₹{total_cost}")
+            except Exception as e:
+                logger.error(f"⚠️ Chat summary transaction error: {e}")
 
         if room and user and room_id in active_connections:
             active_connections[room_id].pop(user["id"], None)
@@ -398,7 +524,6 @@ async def billing_loop(user_websocket, room_id, user_id, creator_id, rate_per_mi
     try:
         logger.info(f"Billing loop started room={room_id} rate=₹{rate_per_min}/min")
 
-        # ✅ Pass creator_id
         await charge_user(user_websocket, room_id, user_id, creator_id, rate_per_min)
 
         while True:
@@ -418,7 +543,6 @@ async def billing_loop(user_websocket, room_id, user_id, creator_id, rate_per_mi
                 logger.info(f"Someone disconnected room {room_id} - stopping billing")
                 break
 
-            # ✅ Pass creator_id
             await charge_user(user_websocket, room_id, user_id, creator_id, rate_per_min)
 
     except asyncio.CancelledError:
@@ -430,16 +554,12 @@ async def billing_loop(user_websocket, room_id, user_id, creator_id, rate_per_mi
 
 
 async def charge_user(user_websocket, room_id: int, user_id: int, creator_id: int, rate_per_min: float):
-    """Deduct from user wallet, credit creator wallet with split"""
+    """Deduct from user wallet, credit creator wallet with split — using helpers"""
 
     # ── 1. Check user balance ────────────────────────────────
-    wallet = execute_query(
-        "SELECT balance FROM wallets WHERE user_id = %s",
-        (user_id,),
-        fetch_one=True
-    )
+    balance = get_balance(user_id)
 
-    if not wallet or float(wallet["balance"]) < rate_per_min:
+    if balance < rate_per_min:
         execute_query(
             "UPDATE chat_rooms SET status = 'ended' WHERE id = %s",
             (room_id,)
@@ -456,68 +576,50 @@ async def charge_user(user_websocket, room_id: int, user_id: int, creator_id: in
         logger.info(f"⛔ Chat ended - insufficient balance room={room_id} user={user_id}")
         raise asyncio.CancelledError
 
-    # ── 2. Deduct from user wallet ───────────────────────────
-    execute_query(
-        "UPDATE wallets SET balance = balance - %s WHERE user_id = %s",
-        (rate_per_min, user_id)
-    )
+    # ── 2. Deduct from user wallet using helper ──────────────
+    wallet = debit_wallet(user_id, rate_per_min)
+    if wallet is None:
+        # Race condition
+        execute_query("UPDATE chat_rooms SET status = 'ended' WHERE id = %s", (room_id,))
+        raise asyncio.CancelledError
 
-    # ── 3. Calculate split ───────────────────────────────────
-    creator_amount, commission = get_creator_share(rate_per_min)
+    # ── 3. Calculate split using helper ──────────────────────
+    split = calculate_split(rate_per_min)
 
-    # ── 4. Credit creator wallet ─────────────────────────────
-    execute_query(
-        """
-        INSERT INTO creator_wallet (creator_id, balance, total_earned)
-        VALUES (%s, %s, %s)
-        ON DUPLICATE KEY UPDATE
-            balance = balance + VALUES(balance),
-            total_earned = total_earned + VALUES(total_earned)
-        """,
-        (creator_id, creator_amount, creator_amount)
-    )
+    # ── 4. Credit creator wallet using helper ────────────────
+    credit_creator_wallet(creator_id, split["creator_amount"])
 
-    # ── 5. Log transaction with full split ───────────────────
+    # ── 5. Update chat_rooms billing fields ──────────────────
     execute_query(
         """
-        INSERT INTO transactions
-            (user_id, creator_id, type, amount, creator_amount, commission_amount, description, status)
-        VALUES (%s, %s, 'chat', %s, %s, %s, %s, 'success')
+        UPDATE chat_rooms 
+        SET duration = COALESCE(duration, 0) + 60,
+            total_cost = COALESCE(total_cost, 0) + %s
+        WHERE id = %s
         """,
-        (
-            user_id,
-            creator_id,
-            rate_per_min,
-            creator_amount,
-            commission,
-            f"Chat session - Room #{room_id}"
-        )
+        (rate_per_min, room_id)
     )
 
     logger.info(
         f"✅ Charged ₹{rate_per_min} room={room_id} | "
-        f"creator=₹{creator_amount} commission=₹{commission}"
+        f"creator=₹{split['creator_amount']} commission=₹{split['commission_amount']}"
     )
 
     # ── 6. Notify user via websocket ─────────────────────────
-    updated_wallet = execute_query(
-        "SELECT balance FROM wallets WHERE user_id = %s",
-        (user_id,),
-        fetch_one=True
-    )
+    new_balance = float(wallet["balance"])
 
     if user_websocket:
         try:
             await user_websocket.send_text(json.dumps({
                 "type": "balance_update",
-                "balance": float(updated_wallet["balance"]) if updated_wallet else 0,
+                "balance": new_balance,
                 "deducted": rate_per_min
             }))
 
-            if updated_wallet and float(updated_wallet["balance"]) < rate_per_min * 2:
+            if new_balance < rate_per_min * 2:
                 await user_websocket.send_text(json.dumps({
                     "type": "low_balance",
-                    "balance": float(updated_wallet["balance"]),
+                    "balance": new_balance,
                     "message": "⚠️ Low balance! Please add money to continue"
                 }))
         except Exception:

@@ -8,6 +8,7 @@ from typing import Optional
 import os
 import shutil
 import uuid
+from app.services.activity_service import get_online_customers_for_creator  # ✅ NEW
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/creators", tags=["Creators"])
@@ -49,9 +50,8 @@ def get_creator_share(total_amount: float) -> tuple[float, float]:
 @router.get("/")
 def get_all_creators(
     category: str = Query(None),
-    search: str = Query(None),
     page: int = Query(1, ge=1),
-    limit: int = Query(20, ge=1, le=100),
+    limit: int = Query(50, ge=1, le=100),
     current_user: dict = Depends(get_current_user)
 ):
     offset = (page - 1) * limit
@@ -76,10 +76,6 @@ def get_all_creators(
         base_query += " AND cp.specialty = %s"
         params.append(category)
 
-    if search:
-        base_query += " AND (u.name LIKE %s OR cp.bio LIKE %s OR cp.specialty LIKE %s)"
-        params.extend([f"%{search}%", f"%{search}%", f"%{search}%"])
-
     base_query += " ORDER BY cp.is_online DESC, cp.rating DESC"
     base_query += f" LIMIT {limit} OFFSET {offset}"
 
@@ -89,15 +85,40 @@ def get_all_creators(
 
 @router.get("/categories")
 def get_categories(current_user: dict = Depends(get_current_user)):
-    categories = execute_query(
-        "SELECT DISTINCT specialty FROM creator_profiles WHERE is_approved = 1 AND is_rejected = 0 ORDER BY specialty",
-        fetch_all=True
-    )
-    result = ["All"] + [c["specialty"] for c in categories if c["specialty"]]
-    return {"success": True, "categories": result}
+    # ✅ Hardcoded 3 categories only
+    return {"success": True, "categories": ["All", "Astrology", "Entertainment", "Fashion"]}
 
 
 # ── IMPORTANT: static routes MUST be before /{creator_id} ──
+
+# ✅ NEW — Online Customers endpoint for Creator Dashboard
+@router.get("/online-customers")
+def get_online_customers(current_user: dict = Depends(get_current_user)):
+    """
+    Returns list of currently online customers (active within last 2 minutes).
+    Only accessible by creators.
+    
+    Uses Redis SCAN to find active user keys, then fetches profile details from MySQL.
+    Response: { success: true, customers: [{ id, name, profile_photo }], count: N }
+    """
+    if current_user["user_type"] != "creator":
+        raise HTTPException(status_code=403, detail="Creator access required")
+
+    try:
+        customers = get_online_customers_for_creator(current_user["id"])
+        logger.info(
+            f"Online customers requested by creator_id={current_user['id']}: "
+            f"{len(customers)} found"
+        )
+        return {
+            "success": True,
+            "customers": customers,
+            "count": len(customers)
+        }
+    except Exception as e:
+        logger.error(f"Error fetching online customers for creator_id={current_user['id']}: {e}", exc_info=True)
+        return {"success": True, "customers": [], "count": 0}
+
 
 @router.get("/dashboard")
 def get_creator_dashboard(current_user: dict = Depends(get_current_user)):
@@ -333,104 +354,77 @@ def toggle_online(current_user: dict = Depends(get_current_user)):
     return {"success": True, "is_online": bool(new_status)}
 
 
-# ── Content Upload ───────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# ── Content Upload (COMMENTED OUT — re-enable later) ─────────
+# ══════════════════════════════════════════════════════════════
 
 UPLOAD_DIR = "uploads"
 os.makedirs(f"{UPLOAD_DIR}/images", exist_ok=True)
 os.makedirs(f"{UPLOAD_DIR}/videos", exist_ok=True)
 
-@router.post("/content/upload")
-async def upload_content(
-    title: str = Form(...),
-    description: str = Form(""),
-    content_type: str = Form(...),
-    price: float = Form(0.0),
-    is_free: int = Form(0),
-    file: UploadFile = File(...),
-    current_user: dict = Depends(get_current_user)
-):
-    if current_user["user_type"] != "creator":
-        raise HTTPException(status_code=403, detail="Creator access required")
-
-    type_map = {
-        "image": "photo",
-        "photo": "photo",
-        "photo_pack": "photo_pack",
-        "video": "video"
-    }
-    if content_type not in type_map:
-        raise HTTPException(status_code=400, detail="Invalid content type. Use: image, photo, photo_pack, video")
-
-    db_type = type_map[content_type]
-
-    allowed_images = ["image/jpeg", "image/png", "image/webp", "image/gif"]
-    allowed_videos = ["video/mp4", "video/webm", "video/quicktime"]
-
-    if db_type in ["photo", "photo_pack"] and file.content_type not in allowed_images:
-        raise HTTPException(status_code=400, detail="Invalid image format. Use JPG, PNG, WEBP")
-    if db_type == "video" and file.content_type not in allowed_videos:
-        raise HTTPException(status_code=400, detail="Invalid video format. Use MP4, WEBM")
-
-    ext = file.filename.rsplit(".", 1)[-1].lower()
-    filename = f"{uuid.uuid4()}.{ext}"
-    folder = "videos" if db_type == "video" else "images"
-    save_path = os.path.join(UPLOAD_DIR, folder, filename)
-
-    with open(save_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-
-    file_url = f"/uploads/{folder}/{filename}"
-    thumbnail = file_url if db_type != "video" else None
-
-    execute_query(
-        """
-        INSERT INTO content (creator_id, title, description, type, price, is_free, thumbnail, status)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending')
-        """,
-        (current_user["id"], title, description, db_type, price, is_free, thumbnail)
-    )
-
-    content_row = execute_query(
-        "SELECT id FROM content WHERE creator_id = %s ORDER BY created_at DESC LIMIT 1",
-        (current_user["id"],),
-        fetch_one=True
-    )
-
-    if not content_row:
-        raise HTTPException(status_code=500, detail="Failed to save content record")
-
-    execute_query(
-        "INSERT INTO content_files (content_id, file_url, file_order) VALUES (%s, %s, 0)",
-        (content_row["id"], file_url)
-    )
-
-    return {
-        "success": True,
-        "message": "Content uploaded! Pending admin approval",
-        "file_url": file_url,
-        "content_id": content_row["id"]
-    }
+# @router.post("/content/upload")
+# async def upload_content(
+#     title: str = Form(...),
+#     description: str = Form(""),
+#     content_type: str = Form(...),
+#     price: float = Form(0.0),
+#     is_free: int = Form(0),
+#     file: UploadFile = File(...),
+#     current_user: dict = Depends(get_current_user)
+# ):
+#     if current_user["user_type"] != "creator":
+#         raise HTTPException(status_code=403, detail="Creator access required")
+#     type_map = {"image": "photo", "photo": "photo", "photo_pack": "photo_pack", "video": "video"}
+#     if content_type not in type_map:
+#         raise HTTPException(status_code=400, detail="Invalid content type")
+#     db_type = type_map[content_type]
+#     allowed_images = ["image/jpeg", "image/png", "image/webp", "image/gif"]
+#     allowed_videos = ["video/mp4", "video/webm", "video/quicktime"]
+#     if db_type in ["photo", "photo_pack"] and file.content_type not in allowed_images:
+#         raise HTTPException(status_code=400, detail="Invalid image format")
+#     if db_type == "video" and file.content_type not in allowed_videos:
+#         raise HTTPException(status_code=400, detail="Invalid video format")
+#     ext = file.filename.rsplit(".", 1)[-1].lower()
+#     filename = f"{uuid.uuid4()}.{ext}"
+#     folder = "videos" if db_type == "video" else "images"
+#     save_path = os.path.join(UPLOAD_DIR, folder, filename)
+#     with open(save_path, "wb") as buffer:
+#         shutil.copyfileobj(file.file, buffer)
+#     file_url = f"/uploads/{folder}/{filename}"
+#     thumbnail = file_url if db_type != "video" else None
+#     execute_query(
+#         "INSERT INTO content (creator_id, title, description, type, price, is_free, thumbnail, status) VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending')",
+#         (current_user["id"], title, description, db_type, price, is_free, thumbnail)
+#     )
+#     content_row = execute_query(
+#         "SELECT id FROM content WHERE creator_id = %s ORDER BY created_at DESC LIMIT 1",
+#         (current_user["id"],), fetch_one=True
+#     )
+#     if not content_row:
+#         raise HTTPException(status_code=500, detail="Failed to save content record")
+#     execute_query(
+#         "INSERT INTO content_files (content_id, file_url, file_order) VALUES (%s, %s, 0)",
+#         (content_row["id"], file_url)
+#     )
+#     return {"success": True, "message": "Content uploaded!", "file_url": file_url, "content_id": content_row["id"]}
 
 
-@router.get("/content/my")
-def get_my_content(current_user: dict = Depends(get_current_user)):
-    if current_user["user_type"] != "creator":
-        raise HTTPException(status_code=403, detail="Creator access required")
+# @router.get("/content/my")
+# def get_my_content(current_user: dict = Depends(get_current_user)):
+#     if current_user["user_type"] != "creator":
+#         raise HTTPException(status_code=403, detail="Creator access required")
+#     content = execute_query(
+#         """SELECT c.id, c.title, c.description, c.type AS content_type,
+#                c.price, c.is_free, c.thumbnail, c.status, c.created_at, cf.file_url
+#         FROM content c LEFT JOIN content_files cf ON c.id = cf.content_id AND cf.file_order = 0
+#         WHERE c.creator_id = %s ORDER BY c.created_at DESC""",
+#         (current_user["id"],), fetch_all=True
+#     )
+#     return {"success": True, "content": content or []}
 
-    content = execute_query(
-        """
-        SELECT c.id, c.title, c.description, c.type AS content_type,
-               c.price, c.is_free, c.thumbnail, c.status, c.created_at,
-               cf.file_url
-        FROM content c
-        LEFT JOIN content_files cf ON c.id = cf.content_id AND cf.file_order = 0
-        WHERE c.creator_id = %s
-        ORDER BY c.created_at DESC
-        """,
-        (current_user["id"],),
-        fetch_all=True
-    )
-    return {"success": True, "content": content or []}
+# ══════════════════════════════════════════════════════════════
+# ── End of commented content section ─────────────────────────
+# ══════════════════════════════════════════════════════════════
 
 
 # ── Reviews ──────────────────────────────────────────────────

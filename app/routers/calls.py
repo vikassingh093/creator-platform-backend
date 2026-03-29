@@ -6,10 +6,19 @@ from app.config import (
     AUDIO_RATE,
     VIDEO_RATE,
     TICK_INTERVAL,
-    CALL_CREATOR_COMMISSION,
     CALL_RING_TIMEOUT_SECONDS,
     CALL_STUCK_TIMEOUT_MINUTES
 )
+
+# ✅ Import helpers — all money logic lives there
+from app.helpers.wallet_helper import (
+    debit_wallet, credit_creator_wallet, get_balance,
+    has_sufficient_balance, ensure_wallet_exists
+)
+from app.helpers.transaction_helper import (
+    record_call_transaction, record_refund, calculate_split
+)
+
 import logging
 import os
 import time
@@ -27,13 +36,15 @@ except ImportError as e:
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/calls", tags=["Calls"])
 
-# ── Pydantic Models — MUST be before routes that use them ──
+
+# ── Pydantic Models ─────────────────────────────────────────
 class TickRequest(BaseModel):
     room_id: int
 
 class EndCallRequest(BaseModel):
     room_id: int
     duration: int
+
 
 # ── Helper ──────────────────────────────────────────────────
 def generate_agora_token(channel_name: str, uid: int) -> str:
@@ -53,7 +64,9 @@ def generate_agora_token(channel_name: str, uid: int) -> str:
         logger.error(f"Agora token error: {e}")
         return f"mock_token_{channel_name}_{uid}"
 
+
 # ── Routes ──────────────────────────────────────────────────
+
 @router.post("/initiate")
 async def initiate_call(
     request: Request,
@@ -91,20 +104,17 @@ async def initiate_call(
 
     rate = AUDIO_RATE if call_type == "audio" else VIDEO_RATE
 
-    wallet = execute_query(
-        "SELECT balance FROM wallets WHERE user_id = %s",
-        (current_user["id"],),
-        fetch_one=True
-    )
-    balance = float(wallet["balance"]) if wallet else 0
+    # ✅ Use helper to check balance
+    balance = get_balance(current_user["id"])
     print(f"📌 Wallet balance: ₹{balance} | Required: ₹{rate}")
 
-    if not wallet or balance < rate:
+    if balance < rate:
         raise HTTPException(
             status_code=400,
             detail=f"Insufficient balance. Need at least ₹{rate} for 1 minute."
         )
 
+    # Clean up stuck calls
     execute_query(
         f"""
         UPDATE call_rooms SET status='ended', ended_at=NOW()
@@ -123,8 +133,8 @@ async def initiate_call(
     execute_query(
         """
         INSERT INTO call_rooms
-        (user_id, creator_id, call_type, channel_name, status, started_at)
-        VALUES (%s, %s, %s, %s, 'ringing', NOW())
+        (user_id, creator_id, call_type, channel_name, status, started_at, initiated_by)
+        VALUES (%s, %s, %s, %s, 'ringing', NOW(), 'customer')
         """,
         (current_user["id"], creator_id, call_type, channel_name)
     )
@@ -153,29 +163,123 @@ async def initiate_call(
     }
 
 
+@router.post("/creator-initiate")
+async def creator_initiate_call(
+    request: Request,
+    current_user: dict = Depends(get_current_user)
+):
+    """Creator initiates call to a customer — CUSTOMER PAYS"""
+    print("=" * 60)
+    print("📞 CREATOR-INITIATED CALL")
+    print("=" * 60)
+
+    if current_user["user_type"] != "creator":
+        raise HTTPException(status_code=403, detail="Only creators can use this endpoint")
+
+    body = await request.json()
+    customer_id = body.get("customer_id")
+    call_type = body.get("call_type")
+
+    if not customer_id:
+        raise HTTPException(status_code=400, detail="customer_id is required")
+    if call_type not in ["audio", "video"]:
+        raise HTTPException(status_code=400, detail="Invalid call type")
+
+    customer = execute_query(
+        "SELECT id, name, phone FROM users WHERE id = %s AND user_type IN ('customer', 'user') AND is_active = 1",
+        (customer_id,),
+        fetch_one=True
+    )
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+
+    creator_profile = execute_query(
+        "SELECT * FROM creator_profiles WHERE user_id = %s AND is_approved = 1",
+        (current_user["id"],),
+        fetch_one=True
+    )
+    if not creator_profile:
+        raise HTTPException(status_code=400, detail="Creator profile not found")
+
+    rate = AUDIO_RATE if call_type == "audio" else VIDEO_RATE
+
+    # ✅ Use helper to check CUSTOMER's balance
+    balance = get_balance(customer_id)
+    print(f"📌 Customer wallet: ₹{balance} | Required: ₹{rate}")
+
+    if balance < rate:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Customer has insufficient balance (₹{balance:.2f}). Need ₹{rate}."
+        )
+
+    # Clean up stuck calls
+    execute_query(
+        f"""
+        UPDATE call_rooms SET status='ended', ended_at=NOW()
+        WHERE status='active' AND started_at < NOW() - INTERVAL {CALL_STUCK_TIMEOUT_MINUTES} MINUTE
+        """
+    )
+
+    channel_name = f"call_{current_user['id']}_{customer_id}_{int(time.time())}"
+    app_id = os.getenv("AGORA_APP_ID", "")
+    creator_token = generate_agora_token(channel_name, uid=1)
+
+    execute_query(
+        """
+        INSERT INTO call_rooms
+        (user_id, creator_id, call_type, channel_name, status, started_at, initiated_by)
+        VALUES (%s, %s, %s, %s, 'ringing', NOW(), 'creator')
+        """,
+        (customer_id, current_user["id"], call_type, channel_name)
+    )
+
+    room = execute_query(
+        "SELECT * FROM call_rooms WHERE creator_id=%s ORDER BY id DESC LIMIT 1",
+        (current_user["id"],),
+        fetch_one=True
+    )
+    print(f"✅ Creator-initiated room: {room['id']} | Channel: {channel_name}")
+
+    return {
+        "success": True,
+        "room_id": room["id"],
+        "channel_name": channel_name,
+        "token": creator_token,
+        "uid": 1,
+        "app_id": app_id,
+        "call_type": call_type,
+        "rate_per_minute": rate,
+        "customer": {
+            "id": customer["id"],
+            "name": customer["name"],
+        }
+    }
+
+
 @router.post("/tick")
 def call_tick(
     body: TickRequest,
     current_user: dict = Depends(get_current_user)
 ):
+    # ✅ Allow both customer AND creator to tick
     room = execute_query(
-        "SELECT * FROM call_rooms WHERE id=%s AND user_id=%s AND status='active'",
-        (body.room_id, current_user["id"]),
+        "SELECT * FROM call_rooms WHERE id=%s AND (user_id=%s OR creator_id=%s) AND status='active'",
+        (body.room_id, current_user["id"], current_user["id"]),
         fetch_one=True
     )
 
     if not room:
         return {"success": False, "should_end": True, "reason": "room_ended"}
 
+    # ✅ Only deduct from the CUSTOMER (user_id), not creator
+    is_payer = (current_user["id"] == room["user_id"])
+
     rate = AUDIO_RATE if room["call_type"] == "audio" else VIDEO_RATE
     tick_cost = round((rate / 60) * TICK_INTERVAL, 4)
 
-    wallet = execute_query(
-        "SELECT balance FROM wallets WHERE user_id=%s",
-        (current_user["id"],),
-        fetch_one=True
-    )
-    balance = float(wallet["balance"]) if wallet else 0
+    # ✅ Use helper to check CUSTOMER's balance
+    balance = get_balance(room["user_id"])
 
     if balance < tick_cost:
         print(f"⚠️ Balance ₹{balance} < tick cost ₹{tick_cost} - ending call")
@@ -190,44 +294,51 @@ def call_tick(
             "balance": balance
         }
 
-    execute_query(
-        "UPDATE wallets SET balance = balance - %s WHERE user_id=%s",
-        (tick_cost, current_user["id"])
-    )
+    # ✅ Only deduct if the CUSTOMER is the one ticking
+    if is_payer:
+        # ✅ Use helper — updates balance AND total_spent
+        wallet = debit_wallet(room["user_id"], tick_cost)
+        if wallet is None:
+            # Race condition — balance dropped between check and debit
+            execute_query(
+                "UPDATE call_rooms SET status='ended', ended_at=NOW() WHERE id=%s",
+                (body.room_id,)
+            )
+            return {
+                "success": True,
+                "should_end": True,
+                "reason": "balance_exhausted",
+                "balance": 0
+            }
 
-    execute_query(
-        "UPDATE call_rooms SET total_cost = COALESCE(total_cost, 0) + %s WHERE id=%s",
-        (tick_cost, body.room_id)
-    )
-
-    creator_earning = round(tick_cost * CALL_CREATOR_COMMISSION, 4)
-    existing = execute_query(
-        "SELECT id FROM creator_wallet WHERE creator_id=%s LIMIT 1",
-        (room["creator_id"],),
-        fetch_one=True
-    )
-    if existing:
+        # ✅ Update call_rooms total_cost
         execute_query(
-            "UPDATE creator_wallet SET balance = balance + %s WHERE creator_id=%s",
-            (creator_earning, room["creator_id"])
+            "UPDATE call_rooms SET total_cost = COALESCE(total_cost, 0) + %s WHERE id=%s",
+            (tick_cost, body.room_id)
+        )
+
+        # ✅ Calculate split and credit creator using helper
+        split = calculate_split(tick_cost)
+        credit_creator_wallet(room["creator_id"], split["creator_amount"])
+
+        new_balance = float(wallet["balance"])
+        print(
+            f"💰 Tick (customer): ₹{tick_cost} deducted | "
+            f"Creator: +₹{split['creator_amount']} | Commission: ₹{split['commission_amount']} | "
+            f"Balance: ₹{new_balance:.2f}"
         )
     else:
-        execute_query(
-            "INSERT INTO creator_wallet (creator_id, balance) VALUES (%s, %s)",
-            (room["creator_id"], creator_earning)
-        )
+        new_balance = balance
+        print(f"💰 Tick (creator): no deduction | Customer balance: ₹{new_balance:.2f}")
 
-    new_balance = balance - tick_cost
     is_low = new_balance < rate
-    minutes_left = new_balance / rate
-
-    print(f"💰 Tick: ₹{tick_cost} deducted | Balance: ₹{new_balance:.2f} | Low: {is_low}")
+    minutes_left = new_balance / rate if rate > 0 else 0
 
     return {
         "success": True,
         "should_end": False,
         "balance": round(new_balance, 2),
-        "tick_cost": tick_cost,
+        "tick_cost": tick_cost if is_payer else 0,
         "low_balance": is_low,
         "minutes_left": round(minutes_left, 1),
         "reason": None
@@ -243,27 +354,65 @@ def end_call(
     print(f"📞 END CALL - room_id={body.room_id}, duration={body.duration}")
     print("=" * 60)
 
+    # ✅ Allow both customer AND creator to end
     room = execute_query(
-        "SELECT * FROM call_rooms WHERE id=%s",
-        (body.room_id,),
+        "SELECT * FROM call_rooms WHERE id=%s AND (user_id=%s OR creator_id=%s)",
+        (body.room_id, current_user["id"], current_user["id"]),
         fetch_one=True
     )
 
     if not room:
         return {"success": True, "duration": 0, "total_cost": 0}
 
+    # Already ended? Don't process again
+    if room.get("status") == "ended":
+        return {
+            "success": True,
+            "duration": room.get("duration", 0),
+            "total_cost": float(room.get("total_cost", 0))
+        }
+
     rate = AUDIO_RATE if room["call_type"] == "audio" else VIDEO_RATE
     total_cost = float(room.get("total_cost") or 0)
+
+    # If total_cost is 0 but duration > 0, calculate from duration (fallback)
     if total_cost == 0 and body.duration > 0:
         total_cost = round((rate / 60) * body.duration, 2)
 
+    # ── Duration = 0 means NOT ANSWERED ───────────────────────
     if body.duration == 0:
-        print("⚠️ Duration=0 - not answered - NO CHARGE")
+        print("⚠️ Duration=0 - not answered")
+
+        # ✅ SCENARIO 3: Check if tick already deducted money (auto-refund)
+        if total_cost > 0:
+            print(f"⚠️ Tick deducted ₹{total_cost} but call not answered — AUTO REFUND")
+
+            # Refund customer
+            from app.helpers.wallet_helper import credit_wallet
+            credit_wallet(room["user_id"], total_cost, update_total_added=False)
+
+            # Reverse creator credit
+            split = calculate_split(total_cost)
+            from app.helpers.wallet_helper import debit_creator_wallet
+            debit_creator_wallet(room["creator_id"], split["creator_amount"])
+
+            # Record refund transaction
+            record_refund(
+                user_id=room["user_id"],
+                amount=total_cost,
+                reason=f"Call not answered - auto refund ({room['call_type']} call)",
+                reference_id=f"call_{body.room_id}",
+                creator_id=room["creator_id"]
+            )
+
+            print(f"✅ Auto refund ₹{total_cost} to user {room['user_id']}")
+
         execute_query(
             "UPDATE call_rooms SET status='ended', ended_at=NOW(), duration=0, total_cost=0 WHERE id=%s",
             (body.room_id,)
         )
 
+        # Notifications — missed call
         try:
             execute_query(
                 """
@@ -304,6 +453,7 @@ def end_call(
 
         return {"success": True, "duration": 0, "total_cost": 0, "message": "Not answered - no charge"}
 
+    # ── CALL WAS ANSWERED — record final transaction ──────────
     minutes = math.ceil(body.duration / 60)
 
     execute_query(
@@ -315,6 +465,7 @@ def end_call(
         (body.duration, total_cost, body.room_id)
     )
 
+    # ✅ Record ONE summary transaction with creator_id, creator_amount, commission
     existing_tx = execute_query(
         "SELECT id FROM transactions WHERE reference_id = %s LIMIT 1",
         (f"call_{body.room_id}",),
@@ -322,22 +473,18 @@ def end_call(
     )
     if not existing_tx:
         try:
-            execute_query(
-                """
-                INSERT INTO transactions (user_id, type, amount, description, reference_id, status)
-                VALUES (%s, %s, %s, %s, %s, 'success')
-                """,
-                (
-                    room["user_id"],
-                    room["call_type"] + "_call",
-                    total_cost,
-                    f"{room['call_type'].title()} call - {body.duration}s ({minutes} min)",
-                    f"call_{body.room_id}"
-                )
+            record_call_transaction(
+                user_id=room["user_id"],
+                creator_id=room["creator_id"],
+                call_type=room["call_type"],
+                duration_seconds=body.duration,
+                total_cost=total_cost,
+                room_id=body.room_id
             )
-            print(f"✅ Transaction saved: ₹{total_cost}")
+            print(f"✅ Transaction saved: ₹{total_cost} (with creator split)")
         except Exception as e:
             print(f"⚠️ Transaction error: {e}")
+            logger.error(f"Transaction recording failed: {e}", exc_info=True)
     else:
         print("⚠️ Transaction already exists - skipping duplicate")
 
@@ -362,6 +509,40 @@ def get_incoming_calls(current_user: dict = Depends(get_current_user)):
         """
     )
 
+    # ── Check 1: Customer receives call FROM creator
+    call = execute_query(
+        """
+        SELECT cr.*, u.name as caller_name
+        FROM call_rooms cr
+        JOIN users u ON u.id = cr.creator_id
+        WHERE cr.user_id = %s
+        AND cr.status = 'ringing'
+        AND cr.initiated_by = 'creator'
+        AND cr.started_at >= NOW() - INTERVAL 30 SECOND
+        ORDER BY cr.started_at DESC
+        LIMIT 1
+        """,
+        (current_user["id"],),
+        fetch_one=True
+    )
+
+    if call:
+        app_id = os.getenv("AGORA_APP_ID", "")
+        customer_token = generate_agora_token(call["channel_name"], uid=2)
+        return {
+            "call": {
+                "room_id": call["id"],
+                "channel_name": call["channel_name"],
+                "call_type": call["call_type"],
+                "caller_name": call["caller_name"],
+                "app_id": app_id,
+                "token": customer_token,
+                "uid": 2,
+                "initiated_by": "creator"
+            }
+        }
+
+    # ── Check 2: Creator receives call FROM customer
     call = execute_query(
         """
         SELECT cr.*, u.name as caller_name
@@ -391,39 +572,75 @@ def get_incoming_calls(current_user: dict = Depends(get_current_user)):
             "caller_name": call["caller_name"],
             "app_id": app_id,
             "token": creator_token,
-            "uid": 2
+            "uid": 2,
+            "initiated_by": "customer"
         }
     }
 
 
 @router.post("/reject/{room_id}")
 def reject_call(room_id: int, current_user: dict = Depends(get_current_user)):
+    """
+    Reject a ringing call.
+    ✅ Scenario 3: If tick already deducted money while ringing, auto-refund.
+    """
+    # Get room info BEFORE ending it
+    room = execute_query(
+        "SELECT * FROM call_rooms WHERE id=%s AND (creator_id=%s OR user_id=%s) AND status='ringing'",
+        (room_id, current_user["id"], current_user["id"]),
+        fetch_one=True
+    )
+
+    if room:
+        total_cost = float(room.get("total_cost") or 0)
+
+        # ✅ AUTO REFUND if tick deducted money during ringing
+        if total_cost > 0:
+            print(f"⚠️ Call {room_id} rejected but ₹{total_cost} was deducted — AUTO REFUND")
+
+            from app.helpers.wallet_helper import credit_wallet
+            credit_wallet(room["user_id"], total_cost, update_total_added=False)
+
+            split = calculate_split(total_cost)
+            from app.helpers.wallet_helper import debit_creator_wallet
+            debit_creator_wallet(room["creator_id"], split["creator_amount"])
+
+            record_refund(
+                user_id=room["user_id"],
+                amount=total_cost,
+                reason=f"Call rejected - auto refund ({room['call_type']} call)",
+                reference_id=f"call_{room_id}",
+                creator_id=room["creator_id"]
+            )
+
+            print(f"✅ Auto refund ₹{total_cost} to user {room['user_id']}")
+
     execute_query(
         """
-        UPDATE call_rooms SET status='ended', ended_at=NOW() 
-        WHERE id=%s AND creator_id=%s AND status='ringing'
+        UPDATE call_rooms SET status='ended', ended_at=NOW(), total_cost=0 
+        WHERE id=%s AND (creator_id=%s OR user_id=%s) AND status='ringing'
         """,
-        (room_id, current_user["id"])
+        (room_id, current_user["id"], current_user["id"])
     )
-    print(f"❌ Call {room_id} rejected by creator {current_user['id']}")
+    print(f"❌ Call {room_id} rejected by user {current_user['id']}")
     return {"success": True}
 
 
 @router.post("/accept/{room_id}")
 def accept_call(room_id: int, current_user: dict = Depends(get_current_user)):
     room = execute_query(
-        "SELECT * FROM call_rooms WHERE id=%s AND creator_id=%s",
-        (room_id, current_user["id"]),
+        "SELECT * FROM call_rooms WHERE id=%s AND (creator_id=%s OR user_id=%s)",
+        (room_id, current_user["id"], current_user["id"]),
         fetch_one=True
     )
     if not room:
         raise HTTPException(status_code=404, detail="Call not found")
 
     execute_query(
-        "UPDATE call_rooms SET status='active' WHERE id=%s AND creator_id=%s",
-        (room_id, current_user["id"])
+        "UPDATE call_rooms SET status='active' WHERE id=%s",
+        (room_id,)
     )
-    print(f"✅ Call {room_id} accepted by creator {current_user['id']}")
+    print(f"✅ Call {room_id} accepted by user {current_user['id']}")
     return {"success": True, "status": "active"}
 
 

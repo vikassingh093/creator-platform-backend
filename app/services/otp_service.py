@@ -36,7 +36,7 @@ def send_sms_mtalkz(phone: str, otp: str) -> bool:
         # ✅ mTalkz requires 91 prefix for Indian numbers
         formatted_phone = phone if phone.startswith("91") else f"91{phone}"
 
-        message = f"Your OTP is {otp}. Valid for {OTP_EXPIRE_MINUTES} minutes. Do not share with anyone."
+        message = f"Your 123Astro verification code is {otp}. This OTP is valid for {OTP_EXPIRE_MINUTES} minutes. Do not share this code with anyone."
 
         # ✅ Build full URL with query params (primary mTalkz method)
         full_url = (
