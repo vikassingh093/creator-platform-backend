@@ -130,18 +130,21 @@ async def initiate_call(
     app_id = os.getenv("AGORA_APP_ID", "")
     token = generate_agora_token(channel_name, uid=1)
 
-    execute_query(
+    # In initiate_call — replace the INSERT + SELECT pattern:
+    # 🔴 FIX #7: Use last_row_id to avoid race condition
+    room_id = execute_query(
         """
         INSERT INTO call_rooms
         (user_id, creator_id, call_type, channel_name, status, started_at, initiated_by)
         VALUES (%s, %s, %s, %s, 'ringing', NOW(), 'customer')
         """,
-        (current_user["id"], creator_id, call_type, channel_name)
+        (current_user["id"], creator_id, call_type, channel_name),
+        last_row_id=True
     )
 
     room = execute_query(
-        "SELECT * FROM call_rooms WHERE user_id=%s ORDER BY id DESC LIMIT 1",
-        (current_user["id"],),
+        "SELECT * FROM call_rooms WHERE id = %s",
+        (room_id,),
         fetch_one=True
     )
     print(f"✅ Room created: {room['id']} | Channel: {channel_name}")

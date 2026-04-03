@@ -38,6 +38,10 @@ class AdminRefundRequest(BaseModel):
     reference_id: Optional[str] = None
     creator_id: Optional[int] = None
 
+class PhotoActionRequest(BaseModel):
+    action: str  # approve | reject
+    reason: Optional[str] = None
+
 
 # ── Stats (with date range) ──────────────────────────────────
 
@@ -392,15 +396,20 @@ def process_withdrawal(
         raise HTTPException(status_code=400, detail="Already processed")
 
     if body.action == "approved":
+        # Record transaction for audit trail
         txn_id = record_withdrawal(
             creator_id=withdrawal["creator_id"],
             amount=withdrawal["amount"],
             withdrawal_request_id=withdrawal_id
         )
+
+        # 🔴 FIX #12: Update total_withdrawn (balance was already deducted in creators.py)
+        # This is the ONLY place total_withdrawn is incremented
         execute_query(
             "UPDATE creator_wallet SET total_withdrawn = total_withdrawn + %s WHERE creator_id = %s",
             (withdrawal["amount"], withdrawal["creator_id"])
         )
+
         execute_query(
             """UPDATE withdrawal_requests 
             SET status = 'approved', admin_note = %s, updated_at = NOW() 
@@ -410,6 +419,7 @@ def process_withdrawal(
         logger.info(f"✅ Withdrawal #{withdrawal_id} approved | ₹{withdrawal['amount']}")
 
     elif body.action == "rejected":
+        # 🔴 FIX #12: Restore balance only (total_withdrawn was never incremented)
         execute_query(
             "UPDATE creator_wallet SET balance = balance + %s WHERE creator_id = %s",
             (withdrawal["amount"], withdrawal["creator_id"])
@@ -420,7 +430,7 @@ def process_withdrawal(
             WHERE id = %s""",
             (body.note, withdrawal_id)
         )
-        logger.info(f"❌ Withdrawal #{withdrawal_id} rejected | ₹{withdrawal['amount']} refunded")
+        logger.info(f"❌ Withdrawal #{withdrawal_id} rejected | ₹{withdrawal['amount']} refunded to balance")
     else:
         raise HTTPException(status_code=400, detail="Action must be approved or rejected")
 
@@ -511,6 +521,93 @@ def get_all_transactions(
         fetch_all=True
     )
     return {"success": True, "data": transactions or []}
+
+
+# ── Photo Approval Management ─────────────────────────────
+
+@router.get("/photo-approvals")
+def get_pending_photos(
+    status: str = "pending",
+    current_user: dict = Depends(require_admin)
+):
+    """Get all creators with pending/approved/rejected photos"""
+    if status == "all":
+        condition = "u.photo_status != 'none'"
+    else:
+        condition = f"u.photo_status = '{status}'"
+
+    photos = execute_query(
+        f"""
+        SELECT u.id, u.name, u.phone, u.profile_photo, u.pending_photo,
+               u.photo_status, u.photo_reject_reason, u.created_at,
+               cp.specialty, cp.rating, cp.total_reviews
+        FROM users u
+        LEFT JOIN creator_profiles cp ON cp.user_id = u.id
+        WHERE {condition}
+        ORDER BY 
+            CASE u.photo_status 
+                WHEN 'pending' THEN 0 
+                WHEN 'rejected' THEN 1 
+                ELSE 2 
+            END,
+            u.created_at DESC
+        """,
+        fetch_all=True
+    )
+    
+    logger.info(f"📸 Photo approvals query status={status}, found={len(photos or [])}")
+    return {"success": True, "data": photos or []}
+
+
+@router.put("/photo-approvals/{user_id}")
+def approve_reject_photo(
+    user_id: int,
+    body: PhotoActionRequest,
+    current_user: dict = Depends(require_admin)
+):
+    """Approve or reject a creator's pending photo"""
+    user = execute_query(
+        "SELECT id, name, pending_photo, photo_status FROM users WHERE id = %s",
+        (user_id,),
+        fetch_one=True
+    )
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if not user["pending_photo"]:
+        raise HTTPException(status_code=400, detail="No pending photo to review")
+
+    if body.action == "approve":
+        # Move pending_photo → profile_photo
+        execute_query(
+            """
+            UPDATE users 
+            SET profile_photo = pending_photo, 
+                pending_photo = NULL, 
+                photo_status = 'approved',
+                photo_reject_reason = NULL
+            WHERE id = %s
+            """,
+            (user_id,)
+        )
+        logger.info(f"✅ Admin approved photo for user {user_id} ({user['name']})")
+        return {"success": True, "message": f"Photo approved for {user['name']}!"}
+
+    elif body.action == "reject":
+        execute_query(
+            """
+            UPDATE users 
+            SET pending_photo = NULL, 
+                photo_status = 'rejected',
+                photo_reject_reason = %s
+            WHERE id = %s
+            """,
+            (body.reason or "Photo not appropriate", user_id)
+        )
+        logger.info(f"❌ Admin rejected photo for user {user_id} ({user['name']}): {body.reason}")
+        return {"success": True, "message": f"Photo rejected for {user['name']}"}
+
+    raise HTTPException(status_code=400, detail="Action must be 'approve' or 'reject'")
 
 
 # ── Content Moderation (COMMENTED OUT — re-enable later) ──

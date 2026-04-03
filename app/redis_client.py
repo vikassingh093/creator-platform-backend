@@ -57,6 +57,7 @@ def redis_exists(key: str) -> bool:
         return False
 
 def redis_increment(key: str, expire_seconds: int = None) -> int:
+    """Increment a key by 1. Sets expiry on first increment."""
     try:
         count = redis_client.incr(key)
         if expire_seconds and count == 1:
@@ -65,3 +66,19 @@ def redis_increment(key: str, expire_seconds: int = None) -> int:
     except Exception as e:
         logger.error(f"Redis INCR error: {e}")
         return 0
+
+def redis_expire(key: str, seconds: int) -> bool:
+    """Set expiry on an existing key."""
+    try:
+        return redis_client.expire(key, seconds)
+    except Exception as e:
+        logger.error(f"Redis EXPIRE error: {e}")
+        return False
+
+def redis_ttl(key: str) -> int:
+    """Get remaining TTL of a key. Returns -1 if no expiry, -2 if key doesn't exist."""
+    try:
+        return redis_client.ttl(key)
+    except Exception as e:
+        logger.error(f"Redis TTL error: {e}")
+        return -2

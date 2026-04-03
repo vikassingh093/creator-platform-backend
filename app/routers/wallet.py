@@ -77,13 +77,17 @@ def get_transactions(current_user: dict = Depends(get_current_user)):
     return {"success": True, "transactions": transactions or []}
 
 
-# ── POST add-money (legacy — kept for backward compatibility) ─
+# ── POST add-money (⚠️ ADMIN-ONLY — manual wallet adjustment) ─
 @router.post("/add-money")
 def add_money(
     body: AddMoneyRequest,
     current_user: dict = Depends(get_current_user)
 ):
     try:
+        # 🔴 FIX: Only admin can use this endpoint (no payment verification here)
+        if current_user.get("user_type") != "admin":
+            raise HTTPException(status_code=403, detail="This endpoint is restricted. Use /create-order for payments.")
+
         if body.amount <= 0:
             raise HTTPException(status_code=400, detail="Invalid amount")
         if body.amount < 10:
@@ -322,12 +326,16 @@ def verify_payment(
         raise HTTPException(status_code=500, detail="Payment verification failed")
 
 
-# ── POST deduct (used by call/chat ticks) ────────────────
+# ── POST deduct (⚠️ ADMIN-ONLY — internal use) ────────────────
 @router.post("/deduct")
 def deduct_money(
     body: DeductRequest,
     current_user: dict = Depends(get_current_user)
 ):
+    # 🔴 FIX: Only admin can manually deduct. Calls/chat use helpers directly.
+    if current_user.get("user_type") != "admin":
+        raise HTTPException(status_code=403, detail="This endpoint is restricted")
+
     if body.amount <= 0:
         raise HTTPException(status_code=400, detail="Invalid amount")
 

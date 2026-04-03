@@ -131,7 +131,7 @@ def start_chat(creator_id: int, current_user: dict = Depends(get_current_user)):
 
 @router.post("/creator/start-with-customer/{customer_id}")
 def creator_start_chat(customer_id: int, current_user: dict = Depends(get_current_user)):
-    """Creator initiates a chat with an online customer — FREE for creator to start"""
+    """Creator initiates a chat with an online customer — CUSTOMER PAYS"""
     logger.info(f"creator_start_chat: creator={current_user['id']} customer_id={customer_id}")
 
     if current_user["user_type"] != "creator":
@@ -152,6 +152,14 @@ def creator_start_chat(customer_id: int, current_user: dict = Depends(get_curren
         fetch_one=True
     )
     chat_rate = float(creator_profile["chat_rate"]) if creator_profile else 0
+
+    # 🔴 FIX #8: Check CUSTOMER's balance before starting chat
+    balance = get_balance(customer_id)
+    if balance < chat_rate:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Customer has insufficient balance (₹{balance:.2f}). Need ₹{chat_rate} minimum."
+        )
 
     existing_room = execute_query(
         "SELECT id, status FROM chat_rooms WHERE user_id = %s AND creator_id = %s ORDER BY id DESC LIMIT 1",

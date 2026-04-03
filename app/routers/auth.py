@@ -1,15 +1,22 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from app.services.otp_service import send_otp, verify_otp
 from app.services.jwt_service import create_access_token, create_refresh_token, revoke_token, verify_token
 from app.database import execute_query
-from app.redis_client import redis_set, redis_delete
+from app.redis_client import redis_set, redis_get, redis_delete, redis_increment, redis_expire
+from app.middleware.auth_middleware import get_current_user
 import logging
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
-SESSION_EXPIRE = 60 * 60 * 2  # 2 hours
+# ── Rate limit settings ───────────────────────────────────
+OTP_SEND_LIMIT = 3          # Max 3 OTPs per phone per window
+OTP_SEND_WINDOW = 600       # 10 minute window
+OTP_VERIFY_LIMIT = 5        # Max 5 verify attempts per phone
+OTP_VERIFY_WINDOW = 600     # 10 minute window
+OTP_LOCKOUT_TIME = 1800     # 30 min lockout after too many failed attempts
+
 
 class SendOTPRequest(BaseModel):
     phone: str
@@ -20,18 +27,38 @@ class VerifyOTPRequest(BaseModel):
     phone: str
     otp: str
 
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str
+
+
 @router.post("/send-otp")
 def send_otp_route(body: SendOTPRequest):
-    # Normalize phone - remove +91 or 91 prefix if present
     phone = body.phone.strip()
     phone = phone.replace("+91", "").replace(" ", "")
     if phone.startswith("91") and len(phone) == 12:
         phone = phone[2:]
 
-    logger.info(f"📲 /send-otp endpoint hit — normalized phone: {phone}")
+    # 🔴 FIX #4: Rate limit — max 3 OTPs per phone per 10 min
+    lockout_key = f"otp_lockout:{phone}"
+    if redis_get(lockout_key):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many requests. Please wait 30 minutes."
+        )
+
+    rate_key = f"otp_send:{phone}"
+    count = redis_increment(rate_key, expire_seconds=OTP_SEND_WINDOW)
+    if count > OTP_SEND_LIMIT:
+        logger.warning(f"🚫 OTP send rate limited: {phone} ({count} attempts)")
+        raise HTTPException(
+            status_code=429,
+            detail="Too many OTP requests. Please wait 10 minutes."
+        )
+
+    logger.info(f"📲 /send-otp — phone: {phone} (attempt {count}/{OTP_SEND_LIMIT})")
     result = send_otp(phone)
-    logger.info(f"📲 /send-otp result: {result}")
     return result
+
 
 @router.post("/verify-otp")
 def verify_otp_route(body: VerifyOTPRequest):
@@ -40,11 +67,36 @@ def verify_otp_route(body: VerifyOTPRequest):
     if phone.startswith("91") and len(phone) == 12:
         phone = phone[2:]
 
+    # 🔴 FIX #5: Rate limit — max 5 verify attempts per 10 min
+    lockout_key = f"otp_lockout:{phone}"
+    if redis_get(lockout_key):
+        raise HTTPException(
+            status_code=429,
+            detail="Account temporarily locked. Try again in 30 minutes."
+        )
+
+    verify_key = f"otp_verify:{phone}"
+    count = redis_increment(verify_key, expire_seconds=OTP_VERIFY_WINDOW)
+
+    if count > OTP_VERIFY_LIMIT:
+        # Lock the phone for 30 minutes
+        redis_set(lockout_key, "locked", OTP_LOCKOUT_TIME)
+        logger.warning(f"🔒 Phone locked due to too many OTP attempts: {phone}")
+        raise HTTPException(
+            status_code=429,
+            detail="Too many failed attempts. Account locked for 30 minutes."
+        )
+
     result = verify_otp(phone, body.otp)
     if not result["success"]:
+        remaining = OTP_VERIFY_LIMIT - count
+        logger.info(f"❌ OTP verify failed: {phone} (attempt {count}, {remaining} left)")
         raise HTTPException(status_code=400, detail=result["message"])
 
-    # Get or create user
+    # ✅ OTP verified — clear rate limit counters
+    redis_delete(verify_key)
+    redis_delete(f"otp_send:{phone}")
+
     user = execute_query(
         "SELECT * FROM users WHERE phone = %s",
         (phone,),
@@ -85,25 +137,28 @@ def verify_otp_route(body: VerifyOTPRequest):
             "email": user.get("email"),
             "profile_photo": user.get("profile_photo"),
             "user_type": user["user_type"],
+            "avatar_id": user.get("avatar_id"),
         }
     }
 
+
+# 🔴 FIX #3: Logout now requires authentication — can only log out yourself
 @router.post("/logout")
-def logout(body: dict):
-    user_id = body.get("user_id")
-    if user_id:
-        redis_delete(f"session:{user_id}")
-        revoke_token(user_id)
-        logger.info(f"✅ User logged out: ID {user_id}")
+def logout(current_user: dict = Depends(get_current_user)):
+    user_id = current_user["id"]
+    redis_delete(f"session:{user_id}")
+    revoke_token(user_id)
+    logger.info(f"✅ User logged out: ID {user_id}")
     return {"success": True, "message": "Logged out successfully"}
 
+
+# ✅ FIX: Use Pydantic model instead of raw dict
 @router.post("/refresh")
-def refresh_token(data: dict):
-    refresh_token = data.get("refresh_token")
-    if not refresh_token:
+def refresh_token_route(body: RefreshTokenRequest):
+    if not body.refresh_token:
         raise HTTPException(status_code=401, detail="Refresh token required")
 
-    payload = verify_token(refresh_token)
+    payload = verify_token(body.refresh_token)
     if not payload:
         raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
 
